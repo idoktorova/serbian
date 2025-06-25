@@ -1,0 +1,16 @@
+version: "3.8"
+services:
+  bot:
+    build: .
+    env_file: .env
+    depends_on:
+      - postgres
+  postgres:
+    image: postgres:15
+    restart: always
+    environment:
+      POSTGRES_USER: botuser
+      POSTGRES_PASSWORD: botpass
+      POSTGRES_DB: botdb
+    volumes:
+      - ./db_init:/docker-entrypoint-initdb.d

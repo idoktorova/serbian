@@ -19,3 +19,13 @@ python bot.py
 ```
 
 The bot currently supports `/start` and `/help` commands and can be extended by adding more handlers in `bot.py`.
+
+## Docker
+
+This repository includes a `Dockerfile` and `docker-compose.yml` to run the bot together with a PostgreSQL database. The database is initialized with a simple `users` table defined in `db_init/init.sql`.
+
+1. Create a `.env` file with `TELEGRAM_TOKEN` inside.
+2. Launch the services:
+   ```bash
+   docker-compose up --build
+   ```
