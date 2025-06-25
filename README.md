@@ -18,7 +18,7 @@ Start the bot with:
 python bot.py
 ```
 
-The bot currently supports `/start` and `/help` commands and can be extended by adding more handlers in `bot.py`.
+The bot currently supports `/start` and `/help`. When `/start` is issued by the allowed user the bot asks whether to begin the Serbian course. Selecting **Да** saves the user's public information in the database together with the registration timestamp, while **Нет** ends the conversation. Additional handlers can be added in `bot.py`.
 
 ## Docker
 
