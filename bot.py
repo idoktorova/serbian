@@ -1,5 +1,6 @@
 import os
 import re
+import openai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -21,6 +22,9 @@ def connect_db():
         user=os.getenv("DB_USER", "botuser"),
         password=os.getenv("DB_PASSWORD", "botpass"),
     )
+
+openai.api_key = os.getenv("OPENAI_API_KEY", "")
+PHRASE_TOPIC = os.getenv("PHRASE_TOPIC", "")
 
 ALLOWED_USERNAME = "i_doktorova"
 
@@ -125,6 +129,81 @@ def record_progress(user_id: int, phrase_id: int, correct: bool) -> None:
     conn.close()
 
 
+def get_recent_incorrect_phrases(user_id: int, limit: int = 20) -> list[dict]:
+    """Return phrases the user answered incorrectly most recently."""
+    conn = connect_db()
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (p.id) p.id, p.original, p.translation, p.difficulty
+                FROM progress pr
+                JOIN phrases p ON p.id = pr.phrase_id
+                WHERE pr.user_id = %s AND pr.correct = false
+                ORDER BY p.id, pr.answered_at DESC
+                LIMIT %s
+                """,
+                (user_id, limit),
+            )
+            rows = cur.fetchall()
+    conn.close()
+    return [
+        {
+            "id": row[0],
+            "original": row[1],
+            "translation": row[2],
+            "difficulty": row[3],
+        }
+        for row in rows
+    ]
+
+
+def save_phrase(original: str, translation: str, difficulty: int = 1) -> None:
+    """Insert a new phrase into the database."""
+    conn = connect_db()
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO phrases (original, translation, difficulty)
+                VALUES (%s, %s, %s)
+                """,
+                (original, translation, difficulty),
+            )
+    conn.close()
+
+
+def request_phrases_from_api(topic: str | None = None, limit: int = 20) -> list[tuple[str, str]]:
+    """Request new phrases from ChatGPT API."""
+    if not openai.api_key:
+        return []
+    if topic:
+        prompt = (
+            f"Сгенерируй {limit} сербских фраз на тему '{topic}'. "
+            "В ответе должны быть только фразы: оригинал и перевод через '|' без какого-либо дополнительного текста"
+        )
+    else:
+        prompt = (
+            f"Сгенерируй {limit} сербских фраз. "
+            "В ответе должны быть только фразы: оригинал и перевод через '|' без какого-либо дополнительного текста"
+        )
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception:
+        return []
+
+    text = response.choices[0].message.content
+    phrases = []
+    for line in text.splitlines():
+        if "|" in line:
+            original, translation = line.split("|", 1)
+            phrases.append((original.strip(), translation.strip()))
+    return phrases
+
+
 def _normalize(text: str) -> list[str]:
     """Return list of word tokens in lowercase."""
     return re.findall(r"\w+", text.lower())
@@ -137,11 +216,24 @@ def translations_match(user_text: str, reference: str) -> bool:
 
 async def send_next_phrase(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Fetch the next phrase and send it to the user."""
-    phrase = get_next_phrase(user_id)
-    if not phrase:
-        await context.bot.send_message(chat_id=chat_id, text="Фразы закончились")
-        context.user_data.pop("current_phrase_id", None)
-        return
+    queue: list[dict] = context.user_data.get("error_queue", [])
+    if queue:
+        phrase = queue.pop(0)
+    else:
+        phrase = get_next_phrase(user_id)
+        if not phrase:
+            errors = get_recent_incorrect_phrases(user_id)
+            if errors:
+                context.user_data["error_queue"] = errors
+                phrase = context.user_data["error_queue"].pop(0)
+            else:
+                new_phrases = request_phrases_from_api(PHRASE_TOPIC or None)
+                for original, translation in new_phrases:
+                    save_phrase(original, translation)
+                phrase = get_next_phrase(user_id)
+                if not phrase:
+                    context.user_data.pop("current_phrase_id", None)
+                    return
 
     context.user_data["current_phrase_id"] = phrase["id"]
     await context.bot.send_message(
