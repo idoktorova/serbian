@@ -1,6 +1,14 @@
 import os
+import re
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+)
 import psycopg2
 
 
@@ -36,6 +44,141 @@ def save_user(user) -> None:
                 (user.id, user.username or ""),
             )
     conn.close()
+
+
+def get_user_id(telegram_id: int) -> int | None:
+    """Return internal user id for the given telegram id."""
+    conn = connect_db()
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM users WHERE telegram_id = %s",
+                (telegram_id,),
+            )
+            row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def get_phrase_by_id(phrase_id: int):
+    """Fetch a phrase by its id."""
+    conn = connect_db()
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, original, translation, difficulty FROM phrases WHERE id = %s",
+                (phrase_id,),
+            )
+            row = cur.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0],
+            "original": row[1],
+            "translation": row[2],
+            "difficulty": row[3],
+        }
+    return None
+
+
+def get_next_phrase(user_id: int):
+    """Return the next phrase for a user or None if finished."""
+    conn = connect_db()
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT p.id, p.original, p.translation, p.difficulty
+                FROM phrase_view p
+                WHERE p.id NOT IN (
+                    SELECT phrase_id FROM progress WHERE user_id = %s
+                )
+                ORDER BY p.difficulty ASC
+                LIMIT 1
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0],
+            "original": row[1],
+            "translation": row[2],
+            "difficulty": row[3],
+        }
+    return None
+
+
+def record_progress(user_id: int, phrase_id: int, correct: bool) -> None:
+    """Insert a progress record."""
+    conn = connect_db()
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO progress (user_id, phrase_id, answered_at, correct)
+                VALUES (%s, %s, NOW(), %s)
+                """,
+                (user_id, phrase_id, correct),
+            )
+    conn.close()
+
+
+def _normalize(text: str) -> list[str]:
+    """Return list of word tokens in lowercase."""
+    return re.findall(r"\w+", text.lower())
+
+
+def translations_match(user_text: str, reference: str) -> bool:
+    """Compare translations by lexemes."""
+    return _normalize(user_text) == _normalize(reference)
+
+
+async def send_next_phrase(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fetch the next phrase and send it to the user."""
+    phrase = get_next_phrase(user_id)
+    if not phrase:
+        await context.bot.send_message(chat_id=chat_id, text="Фразы закончились")
+        context.user_data.pop("current_phrase_id", None)
+        return
+
+    context.user_data["current_phrase_id"] = phrase["id"]
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"Переведите: {phrase['original']}",
+    )
+
+
+async def receive_translation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle user's translation answer."""
+    if not is_allowed(update):
+        return
+
+    phrase_id = context.user_data.get("current_phrase_id")
+    if not phrase_id:
+        return
+
+    user_id = get_user_id(update.effective_user.id)
+    if user_id is None:
+        return
+
+    user_text = update.message.text or ""
+    phrase = get_phrase_by_id(phrase_id)
+    if phrase is None:
+        return
+
+    correct = translations_match(user_text, phrase["translation"])
+    record_progress(user_id, phrase_id, correct)
+
+    if correct:
+        await update.message.reply_text("Верно!")
+    else:
+        await update.message.reply_text(
+            f"Неверно. Правильный перевод: {phrase['translation']}"
+        )
+
+    await send_next_phrase(user_id, update.effective_chat.id, context)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -75,9 +218,19 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if query.data == "register_yes":
         save_user(query.from_user)
-        await query.edit_message_text("Регистрация завершена. Начнем обучение!")
+        keyboard = [
+            [InlineKeyboardButton("Начать перевод", callback_data="start_translation")]
+        ]
+        await query.edit_message_text(
+            "Регистрация завершена. Выберите активность.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
     elif query.data == "register_no":
         await query.edit_message_text("уходите, вам здесь не рады")
+    elif query.data == "start_translation":
+        user_id = get_user_id(query.from_user.id)
+        if user_id is not None:
+            await send_next_phrase(user_id, query.message.chat_id, context)
 
 
 def main() -> None:
@@ -97,6 +250,9 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button))
+    application.add_handler(
+        MessageHandler(filters.TEXT & (~filters.COMMAND), receive_translation)
+    )
 
     application.run_polling()
 
